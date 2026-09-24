@@ -1,0 +1,33 @@
+.grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 6px;
+}
+
+.day {
+  min-height: 92px;
+  background: #1c1c1c;
+  border: 1px solid #2c2c2c;
+  border-radius: 6px;
+  padding: 6px;
+}
+
+.day strong { display: block; margin-bottom: 4px; }
+
+.item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  margin-top: 4px;
+  padding: 4px 6px;
+  background: #2c261f;
+  border-color: #5a4630;
+}
+
+.outside { opacity: 0.45; }
+
+.form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
