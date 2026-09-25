@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { Icon } from "./shared/Icon";
 import { listen } from "@tauri-apps/api/event";
 import type { AspectPreset, ExportProgress, HubSnapshot, ProjectBundle, ProjectDocument, RolloutSlot, Screen } from "./shared/types";
 import * as api from "./shared/api";
@@ -13,12 +14,12 @@ import styles from "./app/shell.module.css";
 import "./app/tokens.css";
 
 const NAV: { id: Screen; label: string; needsProject?: boolean }[] = [
-  { id: "library", label: "Library" },
-  { id: "project", label: "Project", needsProject: true },
-  { id: "editor", label: "Editor", needsProject: true },
-  { id: "copy", label: "Copy", needsProject: true },
-  { id: "calendar", label: "Calendar" },
-  { id: "rollouts", label: "Rollouts" },
+  { id: "library", label: "Overview" },
+  { id: "project", label: "Media library", needsProject: true },
+  { id: "editor", label: "Video editor", needsProject: true },
+  { id: "copy", label: "Writing studio", needsProject: true },
+  { id: "calendar", label: "Content calendar" },
+  { id: "rollouts", label: "Publish studio" },
   { id: "settings", label: "Settings" },
 ];
 
@@ -29,6 +30,7 @@ export default function App() {
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
+  const saveQueue = useRef<Promise<unknown>>(Promise.resolve());
 
   useEffect(() => {
     void refresh();
@@ -37,7 +39,7 @@ export default function App() {
       if (event.payload.done) setBusy(false);
     });
     return () => {
-      void unlisten.then((stop) => stop());
+      void unlisten.then((stop) => stop()).catch(() => undefined);
     };
   }, []);
 
@@ -74,6 +76,7 @@ export default function App() {
 
   async function openProject(id: string) {
     try {
+      await saveQueue.current;
       const next = await api.openProject(id);
       setBundle(next);
       setHub(await api.loadHub());
@@ -85,29 +88,36 @@ export default function App() {
   }
 
   async function persist(project: ProjectDocument) {
-    const saved = await api.saveProject(project);
-    setBundle(saved);
+    const pending = saveQueue.current.catch(() => undefined).then(() => api.saveProject(project));
+    saveQueue.current = pending;
+    const saved = await pending;
     setHub(await api.loadHub());
     return saved;
   }
 
-  if (!hub) return <p className="muted">Opening Harbour…</p>;
+  if (!hub) return <div className={styles.loading}><h1>Harbour<span className="accent">.</span></h1><p className="muted">{error || "Opening your creative workspace…"}</p>{error && <button onClick={() => void refresh()}>Try again</button>}</div>;
 
   return (
     <div className={styles.shell}>
-      <header className={styles.header}>
-        <div className={styles.brand}>Harbour</div>
+      <aside className={styles.sidebar}>
+        <div className={styles.brand}><span className={styles.brandMark}>H</span> harbour<span className="accent">.</span></div>
+        <div className={styles.workspace}><span className={styles.avatar}>Y</span><div>Your workspace<small>Personal studio</small></div></div>
+        <p className={styles.navLabel}>WORKSPACE</p>
         <nav className={styles.nav}>
-          {NAV.filter((item) => !item.needsProject || bundle).map((item) => (
-            <button key={item.id} data-active={screen === item.id} onClick={() => setScreen(item.id)}>{item.label}</button>
+          {NAV.map((item) => (
+            <button key={item.id} disabled={item.needsProject && !bundle} title={item.needsProject && !bundle ? "Open a project to get started" : item.label} data-active={screen === item.id} onClick={() => setScreen(item.id)}><Icon name={item.id} />{item.label}</button>
           ))}
         </nav>
-      </header>
-      {error && <p className="error">{error}</p>}
+        <div className={styles.sidebarBottom}><span className={styles.statusDot} /> Local workspace<p>Your ideas. Your files. Your studio.</p></div>
+      </aside>
+      <div className={styles.content}>
+      <header className={styles.header}><div className="row"><span className="muted">Workspace</span><span className="muted">/</span><strong>{NAV.find(item => item.id === screen)?.label}</strong></div><div className="row">{bundle && <span className={styles.projectPill}>{bundle.project.title}</span>}<span className={styles.avatar}>Y</span></div></header>
+      {error && <div className={styles.errorBanner} role="alert"><span>{error}</span><button aria-label="Dismiss error" onClick={() => setError("")}>×</button></div>}
       <main className={styles.main}>
         {screen === "library" && (
           <LibraryScreen
             hub={hub}
+            onNavigate={setScreen}
             onCreate={(title) => {
               void api.createProject(title).then((next) => {
                 setBundle(next);
@@ -121,7 +131,7 @@ export default function App() {
           />
         )}
         {screen === "project" && bundle && (
-          <ProjectScreen
+          <ProjectScreen key={bundle.project.id}
             bundle={bundle}
             onRename={(title) => void api.renameProject(bundle.project.id, title).then(setBundle).then(refresh).catch(showError)}
             onImport={(paths) => void api.importMedia(bundle.project.id, paths).then(setBundle).catch(showError)}
@@ -134,7 +144,7 @@ export default function App() {
           />
         )}
         {screen === "editor" && bundle && (
-          <EditorScreen bundle={bundle} onChange={(next) => {
+          <EditorScreen key={bundle.project.id} bundle={bundle} onPublish={() => setScreen("rollouts")} onMedia={() => setScreen("project")} onChange={(next) => {
             setBundle(next);
             void persist(next.project).catch(showError);
           }} />
@@ -154,6 +164,7 @@ export default function App() {
             message={message}
             onPrepare={(name, projectId, slots, burnCaptions, outputParent) => void runRollout(name, projectId, slots, burnCaptions, outputParent)}
             onExport={(aspect, burnCaptions, outputPath) => void runExport(aspect, burnCaptions, outputPath)}
+            onSchedule={async (items) => { setHub(await api.saveCalendar(items)); }}
           />
         )}
         {screen === "settings" && (
@@ -162,6 +173,7 @@ export default function App() {
           }} />
         )}
       </main>
+      </div>
     </div>
   );
 

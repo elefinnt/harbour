@@ -77,8 +77,8 @@ function ClipFields({ clip, max, onChange, onSplit, onDelete, onMove }: {
         <input type="number" min={clip.inMs + 100} max={max ?? undefined} value={clip.outMs} onChange={(event) => onChange({ ...clip, outMs: clamp(Number(event.target.value), clip.inMs + 100, max ?? Number(event.target.value)) })} />
       </label>
       <div className="row">
-        <button onClick={() => onMove(-1)}>Move left</button>
-        <button onClick={() => onMove(1)}>Move right</button>
+        <button onClick={() => onMove(-1)}>Nudge left</button>
+        <button onClick={() => onMove(1)}>Nudge right</button>
         <button onClick={onSplit}>Split</button>
         <button onClick={onDelete}>Delete</button>
       </div>

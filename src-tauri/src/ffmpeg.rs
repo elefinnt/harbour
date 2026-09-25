@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 
 use tauri::{AppHandle, Emitter};
 
-use crate::model::{AspectPreset, CaptionBlock, Clip, ExportProgress, MediaAsset, MediaKind, ProjectDocument, TextBlock};
+use crate::model::{AspectPreset, Clip, ExportProgress, MediaAsset, MediaKind, ProjectDocument};
 
 pub fn resolve_ffmpeg(configured: Option<&str>) -> Option<PathBuf> {
     if let Some(path) = configured {
@@ -270,10 +270,21 @@ pub fn render_project(
     }
     let (width, height) = aspect.size();
     let mut cmd_args: Vec<String> = vec!["-y".into(), "-progress".into(), "pipe:1".into(), "-nostats".into()];
-    let mut plans = Vec::new();
     let mut next_index = 0usize;
     let mut duration_ms = 0u64;
-    for clip in &project.timeline.clips {
+    let mut ordered: Vec<&Clip> = project.timeline.clips.iter().collect();
+    ordered.sort_by_key(|clip| clip.timeline_start_ms);
+    let mut cursor = 0u64;
+    let mut pieces: Vec<(u64, u64, InputPlan)> = Vec::new();
+    for clip in ordered {
+        let clip_ms = clip.out_ms.saturating_sub(clip.in_ms).max(100);
+        if clip.timeline_start_ms > cursor.saturating_add(40) {
+            let gap = clip.timeline_start_ms - cursor;
+            let plan = push_gap(&mut cmd_args, &mut next_index, gap, width, height);
+            pieces.push((0, gap, plan));
+            duration_ms += gap;
+            cursor = clip.timeline_start_ms;
+        }
         let asset = project
             .media
             .iter()
@@ -283,15 +294,15 @@ pub fn render_project(
         if !source.exists() {
             return Err(format!("Missing media file {}.", asset.name));
         }
-        let clip_ms = clip.out_ms.saturating_sub(clip.in_ms).max(100);
-        duration_ms += clip_ms;
         let plan = push_clip_inputs(&mut cmd_args, &mut next_index, &source, asset, clip);
-        plans.push((clip, plan, clip_ms));
+        pieces.push((clip.in_ms, clip.out_ms.max(clip.in_ms + 100), plan));
+        duration_ms += clip_ms;
+        cursor = cursor.max(clip.timeline_start_ms + clip_ms);
     }
     let mut filter = String::new();
-    for (index, (clip, plan, _)) in plans.iter().enumerate() {
-        let start = ms_seconds(clip.in_ms);
-        let end = ms_seconds(clip.out_ms.max(clip.in_ms + 100));
+    for (index, (in_ms, out_ms, plan)) in pieces.iter().enumerate() {
+        let start = ms_seconds(*in_ms);
+        let end = ms_seconds(*out_ms);
         filter.push_str(&format!(
             "[{v}:v]trim=start={start}:end={end},setpts=PTS-STARTPTS,scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=30,format=yuv420p[v{index}];",
             v = plan.video_index
@@ -301,21 +312,21 @@ pub fn render_project(
             a = plan.audio_index
         ));
     }
-    for index in 0..plans.len() {
+    for index in 0..pieces.len() {
         filter.push_str(&format!("[v{index}][a{index}]"));
     }
-    filter.push_str(&format!("concat=n={}:v=1:a=1[vcat][aout];", plans.len()));
+    filter.push_str(&format!("concat=n={}:v=1:a=1[vcat][aout];", pieces.len()));
     let mut video_label = "vcat".to_string();
     if burn_captions && !project.timeline.captions.is_empty() {
         let ass = output.with_extension("ass");
-        fs::write(&ass, captions_to_ass(&project.timeline.captions, width, height)).map_err(|err| err.to_string())?;
+        fs::write(&ass, crate::draw::captions_to_ass(&project.timeline.captions, width, height)).map_err(|err| err.to_string())?;
         let escaped = escape_filter_path(&ass);
         filter.push_str(&format!("[{video_label}]subtitles='{escaped}'[vsub];"));
         video_label = "vsub".to_string();
     }
     if !project.timeline.texts.is_empty() {
         filter.push_str(&format!("[{video_label}]"));
-        filter.push_str(&text_filters(&project.timeline.texts));
+        filter.push_str(&crate::draw::text_filters(&project.timeline.texts));
         filter.push_str("[vout]");
         video_label = "vout".to_string();
     }
@@ -346,6 +357,31 @@ pub fn render_project(
     run_ffmpeg(app, ffmpeg, &cmd_args, duration_ms)?;
     emit(app, 100.0, "Export finished", true);
     Ok(())
+}
+
+fn push_gap(args: &mut Vec<String>, next_index: &mut usize, gap_ms: u64, width: u32, height: u32) -> InputPlan {
+    let duration = ms_seconds(gap_ms.max(40));
+    args.extend([
+        "-f".into(),
+        "lavfi".into(),
+        "-t".into(),
+        duration.clone(),
+        "-i".into(),
+        format!("color=c=black:s={width}x{height}:r=30"),
+    ]);
+    let video_index = *next_index;
+    *next_index += 1;
+    args.extend([
+        "-f".into(),
+        "lavfi".into(),
+        "-t".into(),
+        duration,
+        "-i".into(),
+        "anullsrc=channel_layout=stereo:sample_rate=48000".into(),
+    ]);
+    let audio_index = *next_index;
+    *next_index += 1;
+    InputPlan { video_index, audio_index }
 }
 
 fn push_clip_inputs(
@@ -384,72 +420,6 @@ fn push_clip_inputs(
     }
 }
 
-fn text_filters(texts: &[TextBlock]) -> String {
-    let font = escape_filter_path(Path::new(r"C:\Windows\Fonts\arial.ttf"));
-    let mut chain = String::new();
-    for (index, text) in texts.iter().enumerate() {
-        if index > 0 {
-            chain.push(',');
-        }
-        let start = ms_seconds(text.start_ms);
-        let end = ms_seconds(text.end_ms.max(text.start_ms + 100));
-        let x = (text.x.clamp(0.0, 100.0) / 100.0).to_string();
-        let y = (text.y.clamp(0.0, 100.0) / 100.0).to_string();
-        chain.push_str(&format!(
-            "drawtext=fontfile='{font}':text='{}':fontsize={}:fontcolor={}:x=w*{x}-text_w/2:y=h*{y}-text_h/2:enable='between(t,{start},{end})'",
-            escape_drawtext(&text.content),
-            text.size.max(12),
-            css_to_ffmpeg_colour(&text.colour),
-        ));
-    }
-    chain
-}
-
-fn captions_to_ass(captions: &[CaptionBlock], width: u32, height: u32) -> String {
-    let mut body = format!(
-        "[Script Info]\nScriptType: v4.00+\nPlayResX: {width}\nPlayResY: {height}\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,54,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,2,0,2,40,40,80,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
-    );
-    for caption in captions {
-        let text = caption.text.replace('\n', "\\N").replace(',', "，");
-        body.push_str(&format!(
-            "Dialogue: 0,{},{},Default,,0,0,0,,{}\n",
-            ass_time(caption.start_ms),
-            ass_time(caption.end_ms.max(caption.start_ms + 100)),
-            text
-        ));
-    }
-    body
-}
-
-fn ass_time(ms: u64) -> String {
-    let total = ms / 10;
-    let cs = total % 100;
-    let total_s = total / 100;
-    let s = total_s % 60;
-    let total_m = total_s / 60;
-    let m = total_m % 60;
-    let h = total_m / 60;
-    format!("{h}:{m:02}:{s:02}.{cs:02}")
-}
-
-fn css_to_ffmpeg_colour(colour: &str) -> String {
-    let hex = colour.trim().trim_start_matches('#');
-    if hex.len() == 6 {
-        format!("0x{hex}")
-    } else {
-        "white".to_string()
-    }
-}
-
-fn escape_drawtext(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace(':', "\\:")
-        .replace('\'', "\\'")
-        .replace('%', "\\%")
-        .replace('\n', " ")
-}
-
 pub fn escape_filter_path(path: &Path) -> String {
     path.display()
         .to_string()
@@ -458,7 +428,7 @@ pub fn escape_filter_path(path: &Path) -> String {
         .replace('\'', "\\'")
 }
 
-fn ms_seconds(ms: u64) -> String {
+pub fn ms_seconds(ms: u64) -> String {
     format!("{:.3}", ms as f64 / 1000.0)
 }
 

@@ -5,18 +5,15 @@ export function clipDuration(clip: Clip) {
   return Math.max(100, clip.outMs - clip.inMs);
 }
 
-export function reflow(clips: Clip[]): Clip[] {
-  let cursor = 0;
-  return clips.map((clip) => {
-    const duration = clipDuration(clip);
-    const next = { ...clip, timelineStartMs: cursor, outMs: clip.inMs + duration };
-    cursor += duration;
-    return next;
-  });
+export function timelineEnd(clips: Clip[]) {
+  return clips.reduce((max, clip) => Math.max(max, clip.timelineStartMs + clipDuration(clip)), 0);
 }
 
-export function timelineDuration(clips: Clip[]) {
-  return clips.reduce((sum, clip) => sum + clipDuration(clip), 0);
+export function timelineSpan(clips: Clip[], texts: { endMs: number }[], captions: { endMs: number }[]) {
+  const clipEnd = timelineEnd(clips);
+  const textEnd = texts.reduce((max, item) => Math.max(max, item.endMs), 0);
+  const captionEnd = captions.reduce((max, item) => Math.max(max, item.endMs), 0);
+  return Math.max(1000, clipEnd, textEnd, captionEnd);
 }
 
 export function clipAt(clips: Clip[], playhead: number) {
@@ -51,19 +48,94 @@ export function splitClip(clips: Clip[], id: string, playhead: number) {
   const at = clip.inMs + (playhead - clip.timelineStartMs);
   if (at <= clip.inMs + 80 || at >= clip.outMs - 80) return clips;
   const left = { ...clip, outMs: at };
-  const right = { ...clip, id: newId(), inMs: at };
-  const next = [...clips.slice(0, index), left, right, ...clips.slice(index + 1)];
-  return reflow(next);
+  const right = { ...clip, id: newId(), inMs: at, timelineStartMs: playhead };
+  return [...clips.slice(0, index), left, right, ...clips.slice(index + 1)];
 }
 
-export function moveClip(clips: Clip[], id: string, direction: -1 | 1) {
-  const index = clips.findIndex((clip) => clip.id === id);
-  const target = index + direction;
-  if (index < 0 || target < 0 || target >= clips.length) return clips;
-  const next = [...clips];
-  const [item] = next.splice(index, 1);
-  next.splice(target, 0, item);
-  return reflow(next);
+export function replaceClip(clips: Clip[], next: Clip) {
+  return clips.map((clip) => (clip.id === next.id ? next : clip));
+}
+
+export function moveClipTo(clips: Clip[], id: string, startMs: number) {
+  const clip = clips.find((item) => item.id === id);
+  if (!clip) return clips;
+  const start = placeWithoutOverlap(clips, id, Math.max(0, startMs));
+  return replaceClip(clips, { ...clip, timelineStartMs: Math.round(start) });
+}
+
+export function trimClipEdge(
+  clips: Clip[],
+  id: string,
+  edge: "start" | "end",
+  timeMs: number,
+  mediaEndMs: number | null,
+) {
+  const clip = clips.find((item) => item.id === id);
+  if (!clip) return clips;
+  const others = clips.filter((item) => item.id !== id);
+  const fixedEnd = clip.timelineStartMs + clipDuration(clip);
+  if (edge === "start") {
+    const earliest = clip.timelineStartMs - clip.inMs;
+    let start = clamp(timeMs, Math.max(0, earliest), fixedEnd - 100);
+    start = clampAgainstStart(start, fixedEnd, others);
+    const delta = start - clip.timelineStartMs;
+    const inMs = Math.max(0, clip.inMs + delta);
+    return replaceClip(clips, { ...clip, timelineStartMs: Math.round(start), inMs: Math.round(inMs), outMs: Math.round(inMs + (fixedEnd - start)) });
+  }
+  const maxEnd = clip.timelineStartMs + ((mediaEndMs ?? clip.inMs + 120_000) - clip.inMs);
+  let end = clamp(timeMs, clip.timelineStartMs + 100, maxEnd);
+  end = clampAgainstEnd(clip.timelineStartMs, end, others);
+  return replaceClip(clips, { ...clip, outMs: Math.round(clip.inMs + (end - clip.timelineStartMs)) });
+}
+
+export function shiftRange(startMs: number, endMs: number, nextStart: number) {
+  const length = Math.max(100, endMs - startMs);
+  const start = Math.max(0, nextStart);
+  return { startMs: Math.round(start), endMs: Math.round(start + length) };
+}
+
+function placeWithoutOverlap(clips: Clip[], id: string, desiredStart: number) {
+  const clip = clips.find((item) => item.id === id);
+  if (!clip) return desiredStart;
+  const duration = clipDuration(clip);
+  const others = clips.filter((item) => item.id !== id);
+  let start = desiredStart;
+  for (let pass = 0; pass < others.length + 1; pass += 1) {
+    const hit = others.find((other) => overlaps(start, start + duration, other.timelineStartMs, other.timelineStartMs + clipDuration(other)));
+    if (!hit) return start;
+    const before = hit.timelineStartMs - duration;
+    const after = hit.timelineStartMs + clipDuration(hit);
+    start = desiredStart >= hit.timelineStartMs || before < 0 ? after : before;
+  }
+  return Math.max(0, start);
+}
+
+function clampAgainstStart(start: number, fixedEnd: number, others: Clip[]) {
+  let next = start;
+  for (const other of others) {
+    const otherEnd = other.timelineStartMs + clipDuration(other);
+    if (next < otherEnd && fixedEnd > other.timelineStartMs) next = otherEnd;
+  }
+  return Math.min(next, fixedEnd - 100);
+}
+
+function clampAgainstEnd(fixedStart: number, end: number, others: Clip[]) {
+  let next = end;
+  for (const other of others) {
+    const otherEnd = other.timelineStartMs + clipDuration(other);
+    if (fixedStart < otherEnd && next > other.timelineStartMs && other.timelineStartMs >= fixedStart) {
+      next = Math.min(next, other.timelineStartMs);
+    }
+  }
+  return Math.max(next, fixedStart + 100);
+}
+
+function overlaps(start: number, end: number, otherStart: number, otherEnd: number) {
+  return start < otherEnd - 1 && end > otherStart + 1;
+}
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
 }
 
 export function parseSrt(source: string): CaptionBlock[] {

@@ -1,9 +1,9 @@
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { useEffect, useState } from "react";
-import type { ProjectBundle } from "../../shared/types";
-import { newId } from "../../shared/format";
+import { useEffect, useRef, useState } from "react";
+import type { CaptionBlock, Clip, ProjectBundle, TextBlock, Timeline as TimelineDoc } from "../../shared/types";
+import { formatClock, newId } from "../../shared/format";
 import { readTextFile, writeTextFile } from "../../shared/api";
-import { clipAt, formatSrt, moveClip, parseSrt, reflow, splitClip, timelineDuration } from "./timelineMath";
+import { clipAt, clipDuration, formatSrt, moveClipTo, parseSrt, splitClip, timelineEnd, timelineSpan, trimClipEdge } from "./timelineMath";
 import { useHistory } from "./useHistory";
 import { Preview } from "./Preview";
 import { Timeline } from "./Timeline";
@@ -13,139 +13,227 @@ import styles from "./editor.module.css";
 interface Props {
   bundle: ProjectBundle;
   onChange: (bundle: ProjectBundle) => void;
+  onPublish: () => void;
+  onMedia: () => void;
 }
 
-export function EditorScreen({ bundle, onChange }: Props) {
+export function EditorScreen({ bundle, onChange, onPublish, onMedia }: Props) {
   const project = bundle.project;
-  const history = useHistory(project.timeline, (timeline) => onChange({ ...bundle, project: { ...project, timeline: reflowTimeline(timeline) } }));
+  const history = useHistory(project.timeline, (timeline) => onChange({ ...bundle, project: { ...project, timeline } }));
   const [playheadMs, setPlayheadMs] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [zoom, setZoom] = useState(80);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const duration = timelineDuration(project.timeline.clips);
-  const clip = clipAt(project.timeline.clips, playheadMs) ?? project.timeline.clips[0] ?? null;
+  const [live, setLive] = useState<TimelineDoc | null>(null);
+  const timeline = live ?? project.timeline;
+  const span = timelineSpan(timeline.clips, timeline.texts, timeline.captions);
+  const clip = clipAt(timeline.clips, playheadMs);
   const asset = project.media.find((item) => item.id === clip?.assetId) ?? null;
+  const actions = useRef({ splitAtPlayhead, removeSelected, nudge, trimToPlayhead, seekBy });
+  actions.current = { splitAtPlayhead, removeSelected, nudge, trimToPlayhead, seekBy };
 
   useEffect(() => {
     function onKey(event: KeyboardEvent) {
       const target = event.target as HTMLElement;
-      if (target.tagName === "INPUT" || target.tagName === "TEXTAREA") return;
+      if (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT") return;
+      const key = event.key.toLowerCase();
       if (event.code === "Space") {
         event.preventDefault();
         setPlaying((value) => !value);
-      }
-      if (event.key.toLowerCase() === "s") splitAtPlayhead();
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") {
+      } else if (key === "s" || (event.ctrlKey && key === "b")) {
+        event.preventDefault();
+        actions.current.splitAtPlayhead();
+      } else if (key === "delete" || key === "backspace") {
+        event.preventDefault();
+        actions.current.removeSelected();
+      } else if ((event.ctrlKey || event.metaKey) && key === "z") {
         event.preventDefault();
         if (event.shiftKey) history.redo();
         else history.undo();
+      } else if ((event.ctrlKey || event.metaKey) && key === "y") {
+        event.preventDefault();
+        history.redo();
+      } else if (key === "arrowleft" || key === "arrowright") {
+        event.preventDefault();
+        const step = (event.shiftKey ? 1000 : 100) * (key === "arrowleft" ? -1 : 1);
+        if (event.altKey) actions.current.nudge(step);
+        else actions.current.seekBy(step);
+      } else if (key === "home") {
+        setPlaying(false);
+        setPlayheadMs(0);
+      } else if (key === "end") {
+        setPlaying(false);
+        setPlayheadMs(span);
+      } else if (key === "[" || key === "i") {
+        actions.current.trimToPlayhead("start");
+      } else if (key === "]" || key === "o") {
+        actions.current.trimToPlayhead("end");
+      } else if (key === "+" || key === "=") {
+        setZoom((value) => Math.min(400, value + 12));
+      } else if (key === "-" || key === "_") {
+        setZoom((value) => Math.max(20, value - 12));
       }
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   });
 
+  const drivingVideo = playing && asset?.kind === "video" && clip !== null;
+  useEffect(() => {
+    if (!playing || drivingVideo) return;
+    let last = performance.now();
+    let frame = 0;
+    const step = (now: number) => {
+      const dt = now - last;
+      last = now;
+      setPlayheadMs((value) => {
+        const next = value + dt;
+        if (next >= span) {
+          setPlaying(false);
+          return span;
+        }
+        return next;
+      });
+      frame = requestAnimationFrame(step);
+    };
+    frame = requestAnimationFrame(step);
+    return () => cancelAnimationFrame(frame);
+  }, [playing, drivingVideo, clip?.id, span]);
+
+  function commitTimeline(next: TimelineDoc) {
+    setLive(null);
+    history.commit(next);
+  }
+
   function splitAtPlayhead() {
-    if (!clip) return;
-    history.commit(splitClip(project.timeline.clips, clip.id, playheadMs).length === project.timeline.clips.length
-      ? project.timeline
-      : { ...project.timeline, clips: splitClip(project.timeline.clips, clip.id, playheadMs) });
+    const source = timeline.clips;
+    const target = clip ?? source.find((item) => item.id === selectedId);
+    if (!target) return;
+    const next = splitClip(source, target.id, playheadMs);
+    if (next === source) return;
+    const right = next.find((item) => item.timelineStartMs === playheadMs && item.id !== target.id);
+    if (right) setSelectedId(right.id);
+    commitTimeline({ ...timeline, clips: next });
+  }
+
+  function removeSelected() {
+    if (!selectedId) return;
+    commitTimeline({
+      ...timeline,
+      clips: timeline.clips.filter((item) => item.id !== selectedId),
+      texts: timeline.texts.filter((item) => item.id !== selectedId),
+      captions: timeline.captions.filter((item) => item.id !== selectedId),
+    });
+    setSelectedId(null);
+  }
+
+  function seekBy(delta: number) {
+    setPlaying(false);
+    setPlayheadMs((value) => Math.min(span, Math.max(0, value + delta)));
+  }
+
+  function nudge(delta: number) {
+    const selected = timeline.clips.find((item) => item.id === selectedId);
+    if (!selected) return;
+    commitTimeline({ ...timeline, clips: moveClipTo(timeline.clips, selected.id, selected.timelineStartMs + delta) });
+  }
+
+  function trimToPlayhead(edge: "start" | "end") {
+    const selected = timeline.clips.find((item) => item.id === selectedId) ?? clip;
+    if (!selected) return;
+    const limit = project.media.find((item) => item.id === selected.assetId)?.durationMs ?? null;
+    commitTimeline({ ...timeline, clips: trimClipEdge(timeline.clips, selected.id, edge, playheadMs, limit) });
   }
 
   function addClip(assetId: string) {
     const media = project.media.find((item) => item.id === assetId);
     if (!media || media.kind === "audio") return;
     const outMs = media.kind === "image" ? 5000 : Math.max(500, media.durationMs ?? 5000);
-    history.commit({
-      ...project.timeline,
-      clips: reflow([...project.timeline.clips, { id: newId(), assetId, timelineStartMs: 0, inMs: 0, outMs }]),
+    commitTimeline({
+      ...timeline,
+      clips: [...timeline.clips, { id: newId(), assetId, timelineStartMs: timelineEnd(timeline.clips), inMs: 0, outMs }],
     });
   }
 
+  const view = { ...project, timeline };
+
   return (
     <section className={styles.editor}>
+      <div className={styles.editorHeader}><div><span className="eyebrow">EDITING STUDIO</span><h2>{project.title}</h2></div><div className="row"><button onClick={onMedia}>Import / manage media</button><select aria-label="Project aspect ratio" style={{width:150}} value={project.aspect} onChange={e => onChange({...bundle, project:{...project, aspect:e.target.value as ProjectBundle['project']['aspect']}})}><option value="vertical">9:16 · Vertical</option><option value="square">1:1 · Square</option><option value="widescreen">16:9 · Landscape</option></select><button className="primary" onClick={onPublish}>Export & publish →</button></div></div>
       <div className={styles.toolbar}>
         <button onClick={() => setPlaying((value) => !value)}>{playing ? "Pause" : "Play"}</button>
         <button onClick={history.undo} disabled={!history.canUndo}>Undo</button>
         <button onClick={history.redo} disabled={!history.canRedo}>Redo</button>
-        <button onClick={() => setZoom((value) => Math.max(30, value - 20))}>Zoom out</button>
-        <button onClick={() => setZoom((value) => Math.min(240, value + 20))}>Zoom in</button>
-        <button onClick={() => history.commit({ ...project.timeline, texts: [...project.timeline.texts, { id: newId(), startMs: playheadMs, endMs: playheadMs + 2000, content: "Title", size: 42, colour: "#ffffff", x: 50, y: 20 }] })}>Add text</button>
-        <button onClick={() => history.commit({ ...project.timeline, captions: [...project.timeline.captions, { id: newId(), startMs: playheadMs, endMs: playheadMs + 2000, text: "Caption" }] })}>Add caption</button>
-        <span className="muted">{Math.round(playheadMs)} ms / {Math.round(duration)} ms</span>
+        <button onClick={splitAtPlayhead} disabled={!clip}>Split · S</button>
+        <button onClick={removeSelected} disabled={!selectedId}>Delete</button>
+        <button onClick={() => setZoom((value) => Math.max(20, value - 20))}>Zoom out</button>
+        <button onClick={() => setZoom((value) => Math.min(400, value + 20))}>Zoom in</button>
+        <button onClick={() => commitTimeline({ ...timeline, texts: [...timeline.texts, { id: newId(), startMs: playheadMs, endMs: playheadMs + 2000, content: "Title", size: 42, colour: "#ffffff", x: 50, y: 20 }] })}>Add text</button>
+        <button onClick={() => commitTimeline({ ...timeline, captions: [...timeline.captions, { id: newId(), startMs: playheadMs, endMs: playheadMs + 2000, text: "Caption" }] })}>Add caption</button>
+        <span className={styles.timecode}>{formatClock(playheadMs).replace(',', '.')} / {formatClock(span).replace(',', '.')}</span>
       </div>
+      <p className={`${styles.keys} muted`}>Drag edges to trim. Drag a clip to move it. Hold Alt to ignore snapping. Space play, S split, Del delete, arrows seek, Alt+arrows nudge, [ ] trim to the playhead.</p>
       <div className={styles.body}>
         <Preview
           folderPath={bundle.folderPath}
           aspect={project.aspect}
-          clip={clip}
+          clip={clip ?? null}
           asset={asset}
           playheadMs={playheadMs}
           playing={playing}
-          texts={project.timeline.texts}
-          captions={project.timeline.captions}
+          texts={timeline.texts}
+          captions={timeline.captions}
           onTick={setPlayheadMs}
           onClipEnded={() => {
-            const index = project.timeline.clips.findIndex((item) => item.id === clip?.id);
-            const next = project.timeline.clips[index + 1];
-            if (next) setPlayheadMs(next.timelineStartMs);
-            else setPlaying(false);
+            if (!clip) return;
+            const end = clip.timelineStartMs + clipDuration(clip);
+            if (end >= span - 30) {
+              setPlayheadMs(span);
+              setPlaying(false);
+            } else setPlayheadMs(end);
           }}
         />
         <Inspector
-          project={project}
+          project={view}
           selectedId={selectedId}
-          onTimeline={(timeline) => history.commit(timeline)}
+          onTimeline={commitTimeline}
           onAddClip={addClip}
           onSplit={splitAtPlayhead}
-          onDelete={() => {
-            history.commit({
-              ...project.timeline,
-              clips: project.timeline.clips.filter((item) => item.id !== selectedId),
-              texts: project.timeline.texts.filter((item) => item.id !== selectedId),
-              captions: project.timeline.captions.filter((item) => item.id !== selectedId),
-            });
-            setSelectedId(null);
-          }}
-          onMove={(direction) => {
-            if (!selectedId) return;
-            history.commit({ ...project.timeline, clips: moveClip(project.timeline.clips, selectedId, direction) });
-          }}
+          onDelete={removeSelected}
+          onMove={(direction) => nudge(direction * 200)}
           onImportSrt={() => {
             void open({ filters: [{ name: "Subtitles", extensions: ["srt"] }] }).then(async (picked) => {
               if (typeof picked !== "string") return;
               const text = await readTextFile(picked);
-              history.commit({ ...project.timeline, captions: parseSrt(text) });
+              commitTimeline({ ...timeline, captions: parseSrt(text) });
             });
           }}
           onExportSrt={() => {
             void save({ defaultPath: `${project.title}.srt`, filters: [{ name: "Subtitles", extensions: ["srt"] }] }).then(async (picked) => {
               if (typeof picked !== "string") return;
-              await writeTextFile(picked, formatSrt(project.timeline.captions));
+              await writeTextFile(picked, formatSrt(timeline.captions));
             });
           }}
         />
       </div>
-      <div className={styles.timelineWrap}>
-        <Timeline
-          clips={project.timeline.clips}
-          texts={project.timeline.texts}
-          captions={project.timeline.captions}
-          playheadMs={playheadMs}
-          zoom={zoom}
-          selectedId={selectedId}
-          onSeek={(ms) => {
-            setPlaying(false);
-            setPlayheadMs(Math.min(ms, duration));
-          }}
-          onSelect={setSelectedId}
-          names={Object.fromEntries(project.media.map((item) => [item.id, item.name]))}
-        />
-      </div>
+      <Timeline
+        clips={timeline.clips}
+        texts={timeline.texts}
+        captions={timeline.captions}
+        playheadMs={playheadMs}
+        zoom={zoom}
+        selectedId={selectedId}
+        mediaEnds={Object.fromEntries(project.media.map((item) => [item.id, item.durationMs]))}
+        onSeek={(ms) => {
+          setPlaying(false);
+          setPlayheadMs(Math.min(ms, span + 3000));
+        }}
+        onSelect={setSelectedId}
+        onZoom={setZoom}
+        onLive={(clips: Clip[], texts: TextBlock[], captions: CaptionBlock[]) => setLive({ ...timeline, clips, texts, captions })}
+        onCommit={(clips, texts, captions) => commitTimeline({ ...timeline, clips, texts, captions })}
+        names={Object.fromEntries(project.media.map((item) => [item.id, item.name]))}
+      />
     </section>
   );
-}
-
-function reflowTimeline(timeline: ProjectBundle["project"]["timeline"]) {
-  return { ...timeline, clips: reflow(timeline.clips) };
 }

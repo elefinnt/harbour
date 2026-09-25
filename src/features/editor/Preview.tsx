@@ -37,10 +37,12 @@ export function Preview({ folderPath, aspect, clip, asset, playheadMs, playing, 
   return (
     <div className={styles.stage}>
       <div className={`${styles.frame} ${styles[aspect]}`}>
+        {!asset && <div className={styles.previewEmpty}><span>YOUR STORY STARTS HERE</span><p>Add a video or image from Media to your timeline.</p></div>}
         {src && (
           <video
             ref={videoRef}
             src={src}
+            onEnded={onClipEnded}
             onTimeUpdate={(event) => {
               if (!clip || !playing) return;
               const local = event.currentTarget.currentTime * 1000;

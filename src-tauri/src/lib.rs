@@ -1,3 +1,4 @@
+mod draw;
 mod ffmpeg;
 mod model;
 mod store;
